@@ -85,6 +85,17 @@
   .chart-box{position:relative;height:240px}
   .chart-note{font-size:12px;color:var(--faint);margin-top:8px}
 
+  .hist-head{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin:34px 0 12px}
+  .hist-head h2{margin:0}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  .seg button{
+    background:var(--surface);color:var(--muted);border:0;padding:6px 16px;
+    font:inherit;font-size:13px;cursor:pointer;
+  }
+  .seg button + button{border-left:1px solid var(--line)}
+  .seg button.active{background:var(--surface2);color:var(--text);font-weight:600}
+  .hist-status{font-size:13px;color:var(--faint);margin:-4px 0 12px}
+
   .lists{display:grid;grid-template-columns:1fr 1fr;gap:14px}
   @media(max-width:820px){.lists{grid-template-columns:1fr}}
   .list-card{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:6px 0;overflow:hidden}
@@ -151,6 +162,33 @@
       <h3>Launchpad transactions per day</h3>
       <div class="chart-box"><canvas id="txChart"></canvas></div>
       <div class="chart-note" id="txChartNote">Built from the most recent pages of indexed transactions, so early days may be partial.</div>
+    </div>
+  </section>
+
+  <div class="hist-head">
+    <h2>History <em>from daily snapshots committed by this repo's GitHub Action</em></h2>
+    <div class="seg" role="group" aria-label="History granularity">
+      <button class="active" data-gran="daily" type="button">Daily</button>
+      <button data-gran="weekly" type="button">Weekly</button>
+    </div>
+  </div>
+  <div class="hist-status" id="histStatus">Loading snapshot history…</div>
+  <section class="charts" id="histSection" hidden>
+    <div class="chart-card">
+      <h3 id="hHoldersTitle">HOOKR holders</h3>
+      <div class="chart-box"><canvas id="hHolders"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <h3 id="hTxTitle">Launchpad transactions per day</h3>
+      <div class="chart-box"><canvas id="hTx"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <h3 id="hTransfersTitle">Token transfers per day</h3>
+      <div class="chart-box"><canvas id="hTransfers"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <h3 id="hBurnedTitle">Total HOOKR burned</h3>
+      <div class="chart-box"><canvas id="hBurned"></canvas></div>
     </div>
   </section>
 
@@ -408,6 +446,115 @@ async function loadLaunches(){
   }
 }
 
+/* ---------- snapshot history (data/history.json, written by the GitHub Action) ---------- */
+let HISTORY = null, HIST_GRAN = "daily", histCharts = [];
+
+async function loadHistory(){
+  const status = $("histStatus"), section = $("histSection");
+  try{
+    const r = await fetch(`data/history.json?t=${Date.now()}`, {headers:{accept:"application/json"}});
+    if(!r.ok) throw new Error(r.status);
+    HISTORY = await r.json();
+  }catch(e){
+    status.textContent = "No snapshot history yet. Once data/history.json exists in the repo (the daily workflow creates it), charts appear here.";
+    section.hidden = true;
+    return;
+  }
+  if (!Array.isArray(HISTORY) || HISTORY.length < 2){
+    status.textContent = HISTORY && HISTORY.length === 1
+      ? "1 snapshot so far — the workflow adds one per day, so trend lines start tomorrow. You can also trigger it manually from the Actions tab."
+      : "History file is empty — run the \u201cDaily metrics snapshot\u201d workflow from the Actions tab to record the first point.";
+    section.hidden = true;
+    return;
+  }
+  status.textContent = `${HISTORY.length} daily snapshots, ${HISTORY[0].date} → ${HISTORY[HISTORY.length-1].date}.`;
+  section.hidden = false;
+  renderHistory();
+}
+
+// Level metrics (holders, burned): value at each point. Flow metrics (txs, transfers):
+// difference between consecutive lifetime counters.
+function histSeries(gran){
+  const H = HISTORY;
+  const deltas = key => H.map((e,i)=>{
+    if(i===0 || e[key]==null || H[i-1][key]==null) return null;
+    const d = e[key] - H[i-1][key];
+    return d >= 0 ? d : null; // counter reset / bad read → gap, not a lie
+  });
+  if (gran === "daily"){
+    return {
+      labels: H.map(e=>e.date),
+      holders: H.map(e=>e.holders ?? null),
+      burned:  H.map(e=>e.burned ?? null),
+      tx: deltas("txs"),
+      transfers: deltas("transfers"),
+    };
+  }
+  // Weekly: bucket by ISO-ish week (Monday start). Levels take the week's last
+  // reading; flows sum the week's daily deltas.
+  const weekKey = ds => {
+    const d = new Date(ds+"T00:00:00Z");
+    const day = (d.getUTCDay()+6)%7;           // Mon=0
+    d.setUTCDate(d.getUTCDate()-day);
+    return d.toISOString().slice(0,10);        // week's Monday
+  };
+  const txD = deltas("txs"), trD = deltas("transfers");
+  const weeks = new Map();
+  H.forEach((e,i)=>{
+    const k = weekKey(e.date);
+    if(!weeks.has(k)) weeks.set(k,{holders:null,burned:null,tx:null,transfers:null});
+    const w = weeks.get(k);
+    if(e.holders!=null) w.holders = e.holders;   // last non-null wins
+    if(e.burned!=null)  w.burned  = e.burned;
+    if(txD[i]!=null) w.tx = (w.tx??0)+txD[i];
+    if(trD[i]!=null) w.transfers = (w.transfers??0)+trD[i];
+  });
+  const keys = [...weeks.keys()].sort();
+  return {
+    labels: keys.map(k=>"wk of "+k),
+    holders: keys.map(k=>weeks.get(k).holders),
+    burned:  keys.map(k=>weeks.get(k).burned),
+    tx: keys.map(k=>weeks.get(k).tx),
+    transfers: keys.map(k=>weeks.get(k).transfers),
+  };
+}
+
+function renderHistory(){
+  if (!HISTORY || HISTORY.length < 2) return;
+  if (typeof Chart === "undefined"){
+    $("histStatus").textContent = "Chart library blocked (ad-blocker or network) — snapshot data is in data/history.json.";
+    $("histSection").hidden = true;
+    return;
+  }
+  histCharts.forEach(c=>c.destroy());
+  histCharts = [];
+  const s = histSeries(HIST_GRAN);
+  const per = HIST_GRAN === "daily" ? "per day" : "per week";
+  $("hTxTitle").textContent = "Launchpad transactions "+per;
+  $("hTransfersTitle").textContent = "Token transfers "+per;
+  const shortLabels = s.labels.map(l=>l.replace(/^wk of /,""))
+    .map(l=>new Date(l).toLocaleDateString("en-US",{month:"short",day:"numeric"}))
+    .map(l=> HIST_GRAN==="weekly" ? "wk "+l : l);
+  const mk = (id, data, type, color) => histCharts.push(new Chart($(id),{
+    type,
+    data:{labels:shortLabels, datasets:[{data, borderColor:color, backgroundColor: type==="bar"?color:color+"22",
+      fill:type==="line", pointRadius:2, borderWidth:1.5, tension:.25, borderRadius:3, spanGaps:true}]},
+    options:chartOpts(v=>Number(v).toLocaleString("en-US",{notation:"compact"}))
+  }));
+  mk("hHolders",   s.holders,   "line", "#6FDDAF");
+  mk("hTx",        s.tx,        "bar",  "#B9A8E8");
+  mk("hTransfers", s.transfers, "bar",  "#B9A8E8");
+  mk("hBurned",    s.burned,    "line", "#FF9E45");
+}
+
+document.querySelectorAll(".seg button").forEach(b=>{
+  b.addEventListener("click", ()=>{
+    document.querySelectorAll(".seg button").forEach(x=>x.classList.toggle("active", x===b));
+    HIST_GRAN = b.dataset.gran;
+    renderHistory();
+  });
+});
+
 /* ---------- chart defaults ---------- */
 function chartOpts(tickFmt){
   return {
@@ -431,7 +578,7 @@ async function loadAll(){
     });
     const results = await Promise.allSettled([
       loadBurns(), loadToken(), loadMarket(), loadLaunchpad(),
-      loadPriceChart(), loadTransactions(), loadLaunches()
+      loadPriceChart(), loadTransactions(), loadLaunches(), loadHistory()
     ]);
     const failed = results.filter(r=>r.status==="rejected").length;
     $("updated").textContent = "Updated " + new Date().toLocaleTimeString()
